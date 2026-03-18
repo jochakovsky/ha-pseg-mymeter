@@ -132,6 +132,86 @@ does not reliably auto-pass in Playwright, even in headed mode with
 - **Login page hidden fields:** `ExternalLogin=False`,
   `TwoFactorRendered=False`, `SecretQuestionRendered=False`
 
+### Direct Login reCAPTCHA Bypass Attempts (All Failed)
+
+Exhaustive testing confirmed the reCAPTCHA on `/Home/Login` cannot be bypassed
+without a valid token from Google's API.
+
+**Content-Type manipulation (partial bypass — unusable):**
+
+The captcha check reads `Request.Form["g-recaptcha-response"]`. When the
+`Content-Type` is non-form (e.g., `application/json`, `text/plain`,
+`application/xml`), ASP.NET cannot populate `Request.Form`, so the captcha
+check is skipped entirely. However, the **same mechanism that skips captcha
+also prevents credential parsing** — the MVC model binder cannot read
+`LoginEmail`/`LoginPassword` from the body either. Result: captcha bypassed
+but login always fails with "Invalid email address or password" (null creds).
+
+| Content-Type | Captcha Check | Creds Parsed | Result |
+|---|---|---|---|
+| `application/x-www-form-urlencoded` | Yes | Yes | "Please provide a valid login captcha." |
+| `multipart/form-data` | Yes | Yes | "Please provide a valid login captcha." |
+| `application/json` (JSON body) | **Skipped** | No | "Invalid email address or password" |
+| `application/json` (form body) | **Skipped** | No | "Invalid email address or password" |
+| `text/plain` | **Skipped** | No | "Invalid email address or password" |
+| `application/xml` | **Skipped** | No | "Invalid email address or password" |
+
+Attempts to supply credentials via alternative channels while keeping a
+captcha-bypassing Content-Type all failed:
+
+| Channel | Result |
+|---|---|
+| Query string parameters | Server error (antiforgery middleware crash) |
+| Cookie values (`LoginEmail=...`) | Captcha skipped, credentials null |
+| Custom HTTP headers | Captcha skipped, credentials null |
+| JSON body with `[FromBody]`-style binding | Captcha skipped, credentials null |
+| Query string + JSON body combined | Server error |
+
+**Other bypass attempts (all returned "Please provide a valid login captcha."):**
+
+- Empty, missing, whitespace, or dummy `g-recaptcha-response` values
+- `ExternalLogin=True` flag
+- Double-URL-encoded field name (`g%2Drecaptcha%2Dresponse`)
+- Multiple `g-recaptcha-response` fields in the same request
+- Google reCAPTCHA test key format tokens
+- Mobile user-agent strings
+- `charset=utf-7` or `charset=iso-8859-1` on form Content-Type
+- Race condition (rapid parallel requests)
+- Chunked transfer encoding
+
+**Unsigned SAML assertion crafting:**
+
+MyMeter's SP metadata (`/Saml/okta-prod/`) declares `WantAssertionsSigned="false"`.
+Crafted unsigned SAML assertions were POSTed to the ACS endpoint with:
+- Correct Okta issuer (`http://www.okta.com/exktrfl7ruOTPxcyv357`)
+- Email as NameID (`josh@ochakovsky.com`)
+- Attributes: `email`, `customerAccountNumber`, `psegBPN`
+
+Result: "Authentication Error" — same as with a bogus issuer. The server
+validates signatures on the SAML response envelope regardless of the
+`WantAssertionsSigned` flag on assertions. Crafting valid signatures requires
+Okta's private key, which is not accessible.
+
+**Confirmed non-existent endpoints (all 404):** `/Home/LoginExternal`,
+`/Home/LoginSSO`, `/Home/LoginToken`, `/Home/AutoLogin`, `/Home/DirectLogin`,
+`/Home/ApiLogin`, `/Home/Authenticate`, `/Home/SignIn`, `/Account/Login`,
+`/api/login`, `/api/auth`, `/api/token`, `/Token`, `/oauth/token`,
+`/connect/token`
+
+**Other auth-adjacent endpoints:**
+- `/Home/VerifyPasswordReset` (POST) — requires account number, not exploitable
+- `/Home/ChangeExpiredPassword` (POST) — redirects to login, requires session
+- `/Home/ChangeExpiredPasswordExternal` (POST) — redirects to login
+- Basic auth / Bearer tokens on `/Dashboard/ChartData` — redirect to login
+- `/Error` — returns `{"Data":null}`, no session initialization effect
+- `/Base/UpdateSession` — redirects unauthenticated users to `/`
+
+**Conclusion:** Direct MyMeter login without a valid reCAPTCHA token is not
+possible. The only paths to MyMeter authentication are:
+1. **Okta SAML** (pure HTTP, no captcha, requires email MFA) — current solution
+2. **Captcha solving service** (~$0.80/1K solves) — would enable direct login
+3. **Manual captcha** via Playwright in headed mode — original approach
+
 ## Dead Ends Investigated
 
 ### 1. Okta SAML SSO
