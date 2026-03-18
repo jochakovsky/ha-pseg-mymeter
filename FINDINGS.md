@@ -386,26 +386,26 @@ execution or specific form submission context).
    → Sets sid, idx, DT, etc. cookies on id.myaccount.pseg.com
    ```
 
-4. **Inject Okta cookies into Playwright** and navigate to MY METER embed link:
+4. **POST SAML assertion to MyMeter ACS** (pure HTTP, no browser):
    ```
-   page.goto("https://id.myaccount.pseg.com/home/psegnjb2c_mymeter_1/0oatrfl7rvCa020fu357/alntrg33dfnhspzDf357")
+   POST https://mysmartenergy.nj.pseg.com/saml/okta-prod/acs
+   Body: SAMLResponse=<html-decoded value>&RelayState=
+   → 302 redirect to /Dashboard + MM_SID cookie
    ```
-   Playwright follows: embed link → `/app/.../sso/saml` → SAML assertion form
-   → auto-submits to ACS → **302 redirect to /Dashboard** (SUCCESS!)
 
-5. **Extract cookies** (`MM_SID`, `__RequestVerificationToken`) from Playwright
-   context → save to `cookies.json` → use with existing `PsegClient`
+5. **Use MM_SID cookie** with existing `PsegClient` for all API calls.
 
-### Why curl Fails
+### Critical Detail: HTML Entity Decoding
 
-The MyMeter ACS endpoint returns different responses:
-- **Browser form submission**: HTTP 302 redirect to `/Dashboard` (success)
-- **curl POST with identical data**: HTTP 200 with "Authentication Error" page
+The SAML assertion form in Okta's HTML uses HTML entities for special characters
+(e.g., `&#x3d;` for `=` in base64 padding). The SAMLResponse value must be
+**HTML-decoded before URL-encoding** for the form POST. Without this step,
+the ACS returns "Authentication Error" (HTTP 200) instead of the expected
+302 redirect to Dashboard.
 
-The assertion content is identical — verified by using the same Okta session.
-The difference is in how the browser submits the SAML form vs a raw HTTP POST.
-Possible causes: JavaScript-based form submission adds hidden fields, or the
-server checks for browser-specific request characteristics beyond headers.
+This was the root cause of all previous curl failures — the browser's form
+submission automatically decodes HTML entities, but manual extraction via
+regex does not.
 
 ### Why This Is Better Than Direct Login
 
@@ -413,8 +413,8 @@ server checks for browser-specific request characteristics beyond headers.
 |---|---|---|
 | Captcha | Required (reCAPTCHA v2 invisible) | None |
 | MFA | None | Email (automatable via IMAP) |
-| Browser needed | Yes (for captcha) | Yes (for SAML form only) |
-| Headless | No (captcha fails headless) | Yes (SAML works headless) |
+| Browser needed | Yes (for captcha) | **No** |
+| Headless | No (captcha fails headless) | Yes |
 | Human interaction | Yes (solve captcha) | No (MFA from email) |
 | Cost | Free or ~$0.001/captcha solve | Free |
 
@@ -423,7 +423,7 @@ server checks for browser-specific request characteristics beyond headers.
 ### Files
 
 ```
-src/okta-auth.ts — Okta SAML login (no captcha, headless, email MFA)
+src/okta-auth.ts — Okta SAML login (no captcha, no browser, email MFA)
 src/auth.ts      — Legacy: Playwright direct login (requires manual captcha)
 src/captcha.ts   — Captcha solving service adapter (fallback, CapSolver/2Captcha)
 src/client.ts    — PsegClient class with getChartData(), getChartDataForRange(), downloadCsv()
@@ -577,30 +577,25 @@ portal provides monthly billing data, meter readings, and bill PDFs.
 - **MFA required every login** — `allowRememberDevice: false`, no way to skip.
   Automatable via IMAP email reading.
 
-### MyMeter SAML: Works in Browser, Fails in curl
+### MyMeter SAML: Pure HTTP Works (After HTML Entity Fix)
 
-The SAML assertion works when submitted by a real browser (Playwright) but fails
-when POSTed via curl with identical data and headers. The ACS returns 302→Dashboard
-for browser submissions and 200→"Authentication Error" for curl. The root cause
-is unknown but likely related to JavaScript form submission behavior.
-
-**This is a non-issue** since Playwright handles the SAML flow successfully.
+The SAML flow now works entirely via HTTP requests — no browser required.
+The previous curl failures were caused by not HTML-decoding the SAMLResponse
+value before URL-encoding it for the POST body. See "Critical Detail: HTML
+Entity Decoding" above.
 
 ## Next Steps for Fully Unattended Operation
 
 ### Remaining Work
 
-The core auth flow is solved. What's left to productionize:
+The auth flow is fully non-interactive (pure HTTP, no browser). What's left:
 
 1. **IMAP email client** — read MFA codes programmatically from `josh@ochakovsky.com`
    inbox. This is the only remaining manual step.
-2. **Refactor `src/test-saml.ts`** into a proper `src/okta-auth.ts` module that
-   integrates with the daemon for automatic re-auth.
-3. **Test headless mode** — verify Playwright `headless: true` works for the SAML
-   flow (likely yes since no captcha is involved).
-4. **Session refresh strategy** — the Okta session lasts 1 hour. The MyMeter
-   session lasts ~30 min. The daemon already polls every 15 min to keep MyMeter
-   alive. If MyMeter expires, re-auth requires a new Okta login (new MFA code).
+2. **Session refresh strategy** — the Okta session is single-use (consumed by
+   SAML SSO). The MyMeter session lasts ~30 min. The daemon polls every 15 min
+   to keep it alive. If MyMeter expires, re-auth requires a new Okta login
+   (new MFA code).
 
 ### Fallback Options
 

@@ -3,22 +3,10 @@ import { existsSync } from "fs";
 import type { PsegSessionCookies } from "./types";
 
 const OKTA_BASE = "https://id.myaccount.pseg.com";
-const MYMETER_EMBED =
-  "https://id.myaccount.pseg.com/home/psegnjb2c_mymeter_1/0oatrfl7rvCa020fu357/alntrg33dfnhspzDf357";
+const MYMETER_BASE = "https://mysmartenergy.nj.pseg.com";
+const MYMETER_SAML_SSO = `${OKTA_BASE}/app/psegnjb2c_mymeter_1/exktrfl7ruOTPxcyv357/sso/saml`;
 const EMAIL_FACTOR_ID = "emf1by3eg2mEgGVZX358";
 const COOKIE_PATH = "cookies.json";
-
-interface OktaSession {
-  sessionToken: string;
-  cookies: Array<{
-    name: string;
-    value: string;
-    domain: string;
-    path: string;
-    secure: boolean;
-    httpOnly: boolean;
-  }>;
-}
 
 /**
  * Authenticate to Okta via the authn API (no captcha).
@@ -86,125 +74,170 @@ async function verifyEmailMfa(
 }
 
 /**
- * Exchange a sessionToken for Okta session cookies by hitting the SAML SSO
- * endpoint. Returns cookies suitable for Playwright injection.
+ * Use a sessionToken to get a SAML assertion from Okta, then POST it to
+ * MyMeter's ACS endpoint. Pure HTTP — no browser needed.
+ *
+ * The key insight: the SAMLResponse in Okta's HTML contains HTML entities
+ * (e.g., &#x3d; for =) that must be decoded before URL-encoding for the
+ * form POST. Without this, the ACS returns "Authentication Error".
  */
-async function getOktaSessionCookies(
+async function samlLogin(
   sessionToken: string
-): Promise<OktaSession["cookies"]> {
-  const url = `${OKTA_BASE}/app/psegnjb2c_mymeter_1/exktrfl7ruOTPxcyv357/sso/saml?sessionToken=${sessionToken}`;
-  const res = await fetch(url, { redirect: "manual" });
-
-  const cookies: OktaSession["cookies"] = [];
-  for (const header of res.headers.getSetCookie()) {
-    const [nameValue, ...parts] = header.split(";");
-    const [name, ...valueParts] = nameValue.split("=");
-    const value = valueParts.join("=");
-    const isSecure = parts.some((p) => p.trim().toLowerCase() === "secure");
-    const isHttpOnly = parts.some(
-      (p) => p.trim().toLowerCase() === "httponly"
-    );
-    const pathMatch = parts.find((p) =>
-      p.trim().toLowerCase().startsWith("path=")
-    );
-    const path = pathMatch ? pathMatch.trim().split("=")[1] : "/";
-
-    if (name && value) {
-      cookies.push({
-        name: name.trim(),
-        value: value.trim(),
-        domain: "id.myaccount.pseg.com",
-        path,
-        secure: isSecure,
-        httpOnly: isHttpOnly,
-      });
-    }
-  }
-
-  // Also consume the response body (SAML form) — we don't need it,
-  // Playwright will redo this navigation with the cookies.
-  await res.text();
-
-  return cookies;
-}
-
-/**
- * Use Playwright to navigate to the MY METER embed link with Okta session
- * cookies. The browser handles the SAML form auto-submit and we extract
- * the resulting MyMeter session cookies.
- */
-async function samlLoginViaPlaywright(
-  oktaCookies: OktaSession["cookies"],
-  headless: boolean
 ): Promise<PsegSessionCookies> {
-  const { chromium } = await import("playwright");
+  // Step 1: Get SAML assertion from Okta
+  const samlRes = await fetch(
+    `${MYMETER_SAML_SSO}?sessionToken=${sessionToken}`,
+    { redirect: "manual" }
+  );
 
-  const browser = await chromium.launch({ headless });
-  try {
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    });
-
-    await context.addCookies(oktaCookies);
-    const page = await context.newPage();
-
-    await page.goto(MYMETER_EMBED, {
-      waitUntil: "networkidle",
-      timeout: 30000,
-    });
-
-    const url = page.url();
-    if (!url.includes("/Dashboard")) {
-      const errorCount = await page
-        .locator("text=Authentication Error")
-        .count();
-      if (errorCount > 0) {
-        throw new Error(
-          "SAML authentication failed — Okta identity not linked to MyMeter account"
-        );
-      }
-      throw new Error(`Unexpected page after SAML login: ${url}`);
-    }
-
-    const cookies = await context.cookies();
-    const session: PsegSessionCookies = {
-      cookies: cookies
-        .filter((c) => c.domain.includes("mysmartenergy"))
-        .map((c) => ({
-          name: c.name,
-          value: c.value,
-          domain: c.domain,
-          path: c.path,
-          expires: c.expires,
-          httpOnly: c.httpOnly,
-          secure: c.secure,
-          sameSite: c.sameSite as "Strict" | "Lax" | "None",
-        })),
-      savedAt: new Date().toISOString(),
-    };
-
-    return session;
-  } finally {
-    await browser.close();
+  // Follow any redirects manually to reach the SSO endpoint
+  let html: string;
+  if (samlRes.status >= 300 && samlRes.status < 400) {
+    const location = samlRes.headers.get("location")!;
+    const res2 = await fetch(location, { redirect: "follow" });
+    html = await res2.text();
+  } else {
+    html = await samlRes.text();
   }
+
+  // Extract SAMLResponse and RelayState from the auto-submit form
+  const samlMatch = html.match(
+    /name="SAMLResponse"[^>]*value="([^"]+)"/
+  );
+  const relayMatch = html.match(
+    /name="RelayState"[^>]*value="([^"]*?)"/
+  );
+
+  if (!samlMatch) {
+    throw new Error("Could not extract SAMLResponse from Okta response");
+  }
+
+  // HTML-decode the values — this is critical!
+  // Okta's HTML uses entities like &#x3d; for = in base64.
+  const samlResponse = decodeHtmlEntities(samlMatch[1]);
+  const relayState = relayMatch
+    ? decodeHtmlEntities(relayMatch[1])
+    : "";
+
+  // Step 2: POST the SAML assertion to MyMeter's ACS
+  const formBody = new URLSearchParams({
+    SAMLResponse: samlResponse,
+    RelayState: relayState,
+  }).toString();
+
+  const acsRes = await fetch(`${MYMETER_BASE}/saml/okta-prod/acs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Origin": OKTA_BASE,
+      "Referer": `${OKTA_BASE}/`,
+    },
+    body: formBody,
+    redirect: "manual",
+  });
+
+  if (acsRes.status !== 302) {
+    throw new Error(
+      `SAML ACS returned ${acsRes.status} instead of 302 redirect`
+    );
+  }
+
+  const location = acsRes.headers.get("location") ?? "";
+  if (!location.includes("/Dashboard")) {
+    throw new Error(`SAML ACS redirected to unexpected location: ${location}`);
+  }
+
+  // Extract cookies from the ACS response
+  const cookies: PsegSessionCookies["cookies"] = [];
+  for (const header of acsRes.headers.getSetCookie()) {
+    const parsed = parseSetCookie(header);
+    if (parsed) cookies.push(parsed);
+  }
+
+  if (!cookies.find((c) => c.name === "MM_SID")) {
+    throw new Error("ACS response did not set MM_SID cookie");
+  }
+
+  // Step 3: Follow the redirect to Dashboard to get the CSRF token cookie
+  const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+  const dashRes = await fetch(`${MYMETER_BASE}/Dashboard`, {
+    headers: { cookie: cookieHeader },
+    redirect: "follow",
+  });
+  await dashRes.text();
+
+  // Merge any new cookies from the Dashboard response
+  for (const header of dashRes.headers.getSetCookie()) {
+    const parsed = parseSetCookie(header);
+    if (parsed && !cookies.find((c) => c.name === parsed.name)) {
+      cookies.push(parsed);
+    }
+  }
+
+  return {
+    cookies,
+    savedAt: new Date().toISOString(),
+  };
+}
+
+function decodeHtmlEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) =>
+      String.fromCharCode(parseInt(hex, 16))
+    )
+    .replace(/&#(\d+);/g, (_, dec) =>
+      String.fromCharCode(parseInt(dec, 10))
+    )
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+function parseSetCookie(
+  header: string
+): PsegSessionCookies["cookies"][0] | null {
+  const [nameValue, ...parts] = header.split(";");
+  const eqIdx = nameValue.indexOf("=");
+  if (eqIdx === -1) return null;
+
+  const name = nameValue.substring(0, eqIdx).trim();
+  const value = nameValue.substring(eqIdx + 1).trim();
+  if (!name) return null;
+
+  const lower = parts.map((p) => p.trim().toLowerCase());
+  const pathPart = lower.find((p) => p.startsWith("path="));
+  const sameSitePart = lower.find((p) => p.startsWith("samesite="));
+
+  return {
+    name,
+    value,
+    domain: "mysmartenergy.nj.pseg.com",
+    path: pathPart ? pathPart.split("=")[1] : "/",
+    expires: -1,
+    httpOnly: lower.some((p) => p === "httponly"),
+    secure: lower.some((p) => p === "secure"),
+    sameSite: sameSitePart
+      ? ((sameSitePart.split("=")[1].charAt(0).toUpperCase() +
+          sameSitePart.split("=")[1].slice(1)) as "Strict" | "Lax" | "None")
+      : "Lax",
+  };
 }
 
 /**
- * Full Okta SAML login flow. No captcha required.
+ * Full Okta SAML login flow. No captcha, no browser required.
  *
  * 1. Okta primary auth (username/password)
  * 2. Trigger email MFA
- * 3. Wait for MFA code (from stdin or provided)
- * 4. Get Okta session cookies
- * 5. Playwright SAML flow → MyMeter cookies
+ * 3. Verify MFA with code
+ * 4. Get SAML assertion from Okta
+ * 5. POST to MyMeter ACS → session cookies
  *
  * @param mfaCode If provided, skip waiting for stdin input
- * @param headless Run Playwright in headless mode (default: true)
  */
 export async function oktaLogin(
-  mfaCode?: string,
-  headless = true
+  mfaCode?: string
 ): Promise<PsegSessionCookies> {
   const username = process.env.PSEG_OKTA_USERNAME;
   const password = process.env.PSEG_OKTA_PASSWORD;
@@ -238,14 +271,9 @@ export async function oktaLogin(
   console.log("Verifying MFA code...");
   const sessionToken = await verifyEmailMfa(stateToken, code);
 
-  // Step 5: Get Okta session cookies
-  console.log("Establishing Okta session...");
-  const oktaCookies = await getOktaSessionCookies(sessionToken);
-  console.log(`Got ${oktaCookies.length} Okta cookies.`);
-
-  // Step 6: Playwright SAML → MyMeter cookies
-  console.log(`Performing SAML login (headless=${headless})...`);
-  const session = await samlLoginViaPlaywright(oktaCookies, headless);
+  // Step 5: SAML login (pure HTTP, no browser)
+  console.log("Performing SAML login...");
+  const session = await samlLogin(sessionToken);
 
   // Save cookies
   await writeFile(COOKIE_PATH, JSON.stringify(session, null, 2));
@@ -260,8 +288,7 @@ export async function oktaLogin(
 export { loadCookies, cookieHeader } from "./auth";
 
 if (import.meta.main) {
-  const headless = !process.argv.includes("--headed");
   // Accept MFA code as CLI argument: bun run src/okta-auth.ts 123456
   const cliCode = process.argv.find((a) => /^\d{6}$/.test(a));
-  await oktaLogin(cliCode, headless);
+  await oktaLogin(cliCode);
 }
