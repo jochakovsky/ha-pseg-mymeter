@@ -33,10 +33,12 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-# session cookies
+# session cookies / tokens
 cookies.json
 cookies_*.json
 okta_cookies.json
+okta-session.json
+okta-state.json
 
 # collected data
 data/

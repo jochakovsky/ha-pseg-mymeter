@@ -1,6 +1,7 @@
 import { PsegClient } from "./client";
 import { oktaLogin } from "./okta-auth";
 import { loadCookies } from "./auth";
+import { refreshFromOktaSession } from "./session-refresh";
 import { appendFile, mkdir } from "fs/promises";
 import { existsSync } from "fs";
 
@@ -55,17 +56,38 @@ async function fetchAndStore(client: PsegClient): Promise<void> {
   await appendFile(csvPath, rows.join("\n") + "\n");
 }
 
+/**
+ * Try to get a working PsegClient, with fallback chain:
+ * 1. Use existing saved cookies
+ * 2. Refresh via Okta session cookies (no MFA needed)
+ * 3. Full Okta re-auth (requires MFA — will prompt)
+ */
 async function createClient(): Promise<PsegClient> {
+  // Try existing cookies
   try {
     const client = await PsegClient.create();
-    // Test if session is alive
     await client.getChartData();
     return client;
   } catch {
-    console.log("Session expired or invalid. Re-authenticating via Okta...");
-    await oktaLogin();
-    return PsegClient.create();
+    // Session expired — try silent refresh
   }
+
+  // Try Okta session refresh (no MFA)
+  try {
+    console.log("Session expired. Attempting silent refresh via Okta session...");
+    const session = await refreshFromOktaSession();
+    if (session) {
+      console.log("Silent refresh successful — no MFA needed.");
+      return PsegClient.create();
+    }
+  } catch (err: any) {
+    console.log(`Silent refresh failed: ${err.message}`);
+  }
+
+  // Fall back to full Okta auth (requires MFA)
+  console.log("Okta session also expired. Full re-auth required (MFA)...");
+  await oktaLogin();
+  return PsegClient.create();
 }
 
 async function main() {
@@ -93,10 +115,7 @@ async function main() {
         err.message.includes("expired")
       ) {
         try {
-          console.log("Attempting re-login via Okta...");
-          await oktaLogin();
-          client = await PsegClient.create();
-          console.log("Re-login successful.");
+          client = await createClient();
           consecutiveErrors = 0;
         } catch (loginErr: any) {
           console.error("Re-login failed:", loginErr.message);

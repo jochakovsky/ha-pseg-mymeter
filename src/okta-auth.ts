@@ -73,6 +73,27 @@ async function verifyEmailMfa(
   return data.sessionToken;
 }
 
+const OKTA_SESSION_FILE = "okta-session.json";
+
+/**
+ * Exchange a sessionToken for Okta session cookies and save them.
+ * These can be reused to get new SAML assertions without MFA
+ * for up to 60 minutes.
+ */
+async function saveOktaSessionCookies(sessionToken: string): Promise<void> {
+  const res = await fetch(
+    `${OKTA_BASE}/login/sessionCookieRedirect?token=${sessionToken}&redirectUrl=${encodeURIComponent(OKTA_BASE)}`,
+    { redirect: "manual" }
+  );
+  const cookies = res.headers.getAll("set-cookie");
+  const cookieStr = cookies.map((c) => c.split(";")[0]).join("; ");
+  await writeFile(
+    OKTA_SESSION_FILE,
+    JSON.stringify({ cookies: cookieStr, savedAt: new Date().toISOString() }, null, 2)
+  );
+  console.log(`Saved Okta session cookies (${cookies.length} cookies) for silent refresh.`);
+}
+
 /**
  * Use a sessionToken to get a SAML assertion from Okta, then POST it to
  * MyMeter's ACS endpoint. Pure HTTP — no browser needed.
@@ -271,7 +292,11 @@ export async function oktaLogin(
   console.log("Verifying MFA code...");
   const sessionToken = await verifyEmailMfa(stateToken, code);
 
-  // Step 5: SAML login (pure HTTP, no browser)
+  // Step 5: Save Okta session cookies (for silent refresh later)
+  console.log("Saving Okta session cookies...");
+  await saveOktaSessionCookies(sessionToken);
+
+  // Step 6: SAML login (pure HTTP, no browser)
   console.log("Performing SAML login...");
   const session = await samlLogin(sessionToken);
 
