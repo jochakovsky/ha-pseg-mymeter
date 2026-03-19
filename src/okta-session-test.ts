@@ -240,16 +240,19 @@ async function trySamlWithSession(cookies: string): Promise<boolean> {
   return false;
 }
 
-/**
- * Step 4: Full Okta auth to get fresh session cookies (for testing).
- */
+const MFA_FACTORS = {
+  email: "emf1by3eg2mEgGVZX358",
+  sms: "sms1by3iwjnmPnvbx358",
+} as const;
+type MfaMethod = keyof typeof MFA_FACTORS;
+
 const STATE_TOKEN_FILE = "okta-state.json";
 
 /**
  * Step 1 of auth: primary auth + trigger MFA. Saves stateToken to file.
  * Run this first, then run "verify <code>" with the emailed code.
  */
-async function triggerMfa(): Promise<void> {
+async function triggerMfaStep(method: MfaMethod): Promise<void> {
   const username = process.env.PSEG_OKTA_USERNAME;
   const password = process.env.PSEG_OKTA_PASSWORD;
   if (!username || !password) {
@@ -269,10 +272,10 @@ async function triggerMfa(): Promise<void> {
   }
 
   const stateToken = authData.stateToken;
-  const emailFactorId = "emf1by3eg2mEgGVZX358";
+  const factorId = MFA_FACTORS[method];
 
-  console.log("Triggering email MFA...");
-  await fetch(`${OKTA_BASE}/api/v1/authn/factors/${emailFactorId}/verify`, {
+  console.log(`Triggering ${method} MFA...`);
+  await fetch(`${OKTA_BASE}/api/v1/authn/factors/${factorId}/verify`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ stateToken }),
@@ -280,25 +283,27 @@ async function triggerMfa(): Promise<void> {
 
   await writeFile(
     STATE_TOKEN_FILE,
-    JSON.stringify({ stateToken, savedAt: new Date().toISOString() })
+    JSON.stringify({ stateToken, method, savedAt: new Date().toISOString() })
   );
-  console.log("MFA email sent. Now run:");
+  console.log(`MFA code sent via ${method}. Now run:`);
   console.log("  bun src/okta-session-test.ts verify <6-digit-code>");
 }
 
 /**
  * Step 2 of auth: verify MFA code using saved stateToken.
  */
-async function verifyMfa(code: string): Promise<string> {
+async function verifyMfaStep(code: string): Promise<string> {
   if (!existsSync(STATE_TOKEN_FILE)) {
     throw new Error("No saved state token. Run 'auth' first.");
   }
-  const { stateToken } = JSON.parse(await readFile(STATE_TOKEN_FILE, "utf-8"));
-  const emailFactorId = "emf1by3eg2mEgGVZX358";
+  const { stateToken, method = "email" } = JSON.parse(
+    await readFile(STATE_TOKEN_FILE, "utf-8")
+  );
+  const factorId = MFA_FACTORS[method as MfaMethod];
 
-  console.log("Verifying MFA...");
+  console.log(`Verifying ${method} MFA...`);
   const verifyRes = await fetch(
-    `${OKTA_BASE}/api/v1/authn/factors/${emailFactorId}/verify`,
+    `${OKTA_BASE}/api/v1/authn/factors/${factorId}/verify`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -325,17 +330,19 @@ async function verifyMfa(code: string): Promise<string> {
 async function main() {
   const mode = process.argv[2] ?? "check";
 
+  const mfaMethod: MfaMethod = process.argv.includes("--sms") ? "sms" : "email";
+
   if (mode === "auth") {
     // Step 1: primary auth + trigger MFA
-    await triggerMfa();
+    await triggerMfaStep(mfaMethod);
   } else if (mode === "verify") {
     // Step 2: verify MFA code + exchange for session cookies
-    const code = process.argv[3];
-    if (!code || !/^\d{6}$/.test(code)) {
+    const code = process.argv.find((a) => /^\d{6}$/.test(a));
+    if (!code) {
       console.error("Usage: bun src/okta-session-test.ts verify <6-digit-code>");
       process.exit(1);
     }
-    const cookies = await verifyMfa(code);
+    const cookies = await verifyMfaStep(code);
     console.log("\nOkta session cookies saved. Now checking session...");
     await checkOktaSession(cookies);
     console.log("\nNow attempting SAML assertion...");

@@ -5,7 +5,11 @@ import type { PsegSessionCookies } from "./types";
 const OKTA_BASE = "https://id.myaccount.pseg.com";
 const MYMETER_BASE = "https://mysmartenergy.nj.pseg.com";
 const MYMETER_SAML_SSO = `${OKTA_BASE}/app/psegnjb2c_mymeter_1/exktrfl7ruOTPxcyv357/sso/saml`;
-const EMAIL_FACTOR_ID = "emf1by3eg2mEgGVZX358";
+const MFA_FACTORS = {
+  email: "emf1by3eg2mEgGVZX358",
+  sms: "sms1by3iwjnmPnvbx358",
+} as const;
+type MfaMethod = keyof typeof MFA_FACTORS;
 const COOKIE_PATH = "cookies.json";
 
 /**
@@ -35,10 +39,11 @@ async function oktaPrimaryAuth(
   return data.stateToken;
 }
 
-/** Trigger email MFA challenge. */
-async function triggerEmailMfa(stateToken: string): Promise<void> {
+/** Trigger MFA challenge via email or SMS. */
+async function triggerMfa(stateToken: string, method: MfaMethod): Promise<void> {
+  const factorId = MFA_FACTORS[method];
   const res = await fetch(
-    `${OKTA_BASE}/api/v1/authn/factors/${EMAIL_FACTOR_ID}/verify`,
+    `${OKTA_BASE}/api/v1/authn/factors/${factorId}/verify`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -51,13 +56,15 @@ async function triggerEmailMfa(stateToken: string): Promise<void> {
   }
 }
 
-/** Complete email MFA with the passcode. Returns a sessionToken. */
-async function verifyEmailMfa(
+/** Complete MFA with the passcode. Returns a sessionToken. */
+async function verifyMfa(
   stateToken: string,
-  passCode: string
+  passCode: string,
+  method: MfaMethod
 ): Promise<string> {
+  const factorId = MFA_FACTORS[method];
   const res = await fetch(
-    `${OKTA_BASE}/api/v1/authn/factors/${EMAIL_FACTOR_ID}/verify`,
+    `${OKTA_BASE}/api/v1/authn/factors/${factorId}/verify`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -250,15 +257,17 @@ function parseSetCookie(
  * Full Okta SAML login flow. No captcha, no browser required.
  *
  * 1. Okta primary auth (username/password)
- * 2. Trigger email MFA
+ * 2. Trigger MFA (email or SMS)
  * 3. Verify MFA with code
  * 4. Get SAML assertion from Okta
  * 5. POST to MyMeter ACS → session cookies
  *
  * @param mfaCode If provided, skip waiting for stdin input
+ * @param mfaMethod "email" (default) or "sms"
  */
 export async function oktaLogin(
-  mfaCode?: string
+  mfaCode?: string,
+  mfaMethod: MfaMethod = "email"
 ): Promise<PsegSessionCookies> {
   const username = process.env.PSEG_OKTA_USERNAME;
   const password = process.env.PSEG_OKTA_PASSWORD;
@@ -272,10 +281,10 @@ export async function oktaLogin(
   console.log("Authenticating with Okta...");
   const stateToken = await oktaPrimaryAuth(username, password);
 
-  // Step 2: Trigger email MFA
-  console.log("Triggering email MFA...");
-  await triggerEmailMfa(stateToken);
-  console.log("MFA code sent to email.");
+  // Step 2: Trigger MFA
+  console.log(`Triggering ${mfaMethod} MFA...`);
+  await triggerMfa(stateToken, mfaMethod);
+  console.log(`MFA code sent via ${mfaMethod}.`);
 
   // Step 3: Get MFA code
   let code = mfaCode;
@@ -290,7 +299,7 @@ export async function oktaLogin(
 
   // Step 4: Verify MFA → sessionToken
   console.log("Verifying MFA code...");
-  const sessionToken = await verifyEmailMfa(stateToken, code);
+  const sessionToken = await verifyMfa(stateToken, code, mfaMethod);
 
   // Step 5: Save Okta session cookies (for silent refresh later)
   console.log("Saving Okta session cookies...");
@@ -313,7 +322,8 @@ export async function oktaLogin(
 export { loadCookies, cookieHeader } from "./auth";
 
 if (import.meta.main) {
-  // Accept MFA code as CLI argument: bun run src/okta-auth.ts 123456
+  // Usage: bun src/okta-auth.ts [--sms] [code]
   const cliCode = process.argv.find((a) => /^\d{6}$/.test(a));
-  await oktaLogin(cliCode);
+  const method: MfaMethod = process.argv.includes("--sms") ? "sms" : "email";
+  await oktaLogin(cliCode, method);
 }
